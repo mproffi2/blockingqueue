@@ -2,16 +2,10 @@
 make
 
 2. To Run:
-make run
+Parallel: ./parallel_client --parallel "Tom Hanks" 3
+Sequential: ./parallel_client --sequential "Tom Hanks" 3
 
-3. Program will prompt for:
-Mode (--sequential or --parallel)
-
-Start node (e.g., Tom Hanks)
-
-Depth (integer)
-
-4. Clean:
+3. Clean:
 make clean
 
 Notes:
