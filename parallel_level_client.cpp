@@ -2,12 +2,17 @@
 #include <string>
 #include <queue>
 #include <unordered_set>
-#include <cstdio>
-#include <cstdlib>
+#include <vector>
 #include <curl/curl.h>
 #include <stdexcept>
 #include "rapidjson/error/error.h"
 #include "rapidjson/reader.h"
+#include <chrono>
+#include "rapidjson/document.h"
+#include <thread>              
+#include <mutex>               
+#include <condition_variable>  
+#include <atomic>              
 
 
 struct ParseException : std::runtime_error, rapidjson::ParseResult {
@@ -99,77 +104,207 @@ std::vector<std::string> get_neighbors(const std::string& json_str) {
     return neighbors;
 }
 
+// BlockingQueue class
+template<typename T>
+class BlockingQueue {
+private:
+    std::queue<T> q;
+    std::mutex m;
+    std::condition_variable cv;
+public:
+    void push(const T& item) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            q.push(item);
+        }
+        cv.notify_one();
+    }
+
+    bool pop(T& out, std::atomic<bool>& done) {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&]{ return !q.empty() || done.load(); });
+        if (q.empty()) return false;
+        out = q.front();
+        q.pop();
+        return true;
+    }
+
+    void notify_all() { cv.notify_all(); }
+};
+
+struct WorkItem {
+    std::string node;
+    int level;
+};
+
+// Parallel BFS implementation using BlockingQueue
+std::vector<std::vector<std::string>> parallel_bfs(CURL* /*unused*/, const std::string& start, int depth) {
+    const int num_threads = 8;
+    BlockingQueue<WorkItem> queue;
+    std::unordered_set<std::string> visited;
+    std::mutex visited_m;
+    std::mutex levels_m;
+    std::atomic<int> tasks(0);
+    std::atomic<bool> done(false);
+    std::vector<std::vector<std::string>> levels(depth + 1);
+
+    {
+        std::lock_guard<std::mutex> lk(visited_m);
+        visited.insert(start);
+    }
+    queue.push(WorkItem{start, 0});
+    tasks.fetch_add(1);
+
+    auto worker = [&](int id) {
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            std::cerr << "Worker " << id << " failed to initialize CURL\n";
+            return;
+        }
+
+        while (true) {
+            WorkItem item;
+            bool got = queue.pop(item, done);
+            if (!got) {
+                if (done.load()) break;
+                else continue;
+            }
+
+            if (item.level >= 0 && item.level <= depth) {
+                std::lock_guard<std::mutex> lk(levels_m);
+                levels[item.level].push_back(item.node);
+            }
+
+            if (item.level < depth) {
+                try {
+                    std::string json = fetch_neighbors(curl, item.node);
+                    auto neigh = get_neighbors(json);
+                    for (const auto& n : neigh) {
+                        bool should_enqueue = false;
+                        {
+                            std::lock_guard<std::mutex> lk(visited_m);
+                            if (!visited.count(n)) {
+                                visited.insert(n);
+                                should_enqueue = true;
+                            }
+                        }
+                        if (should_enqueue) {
+                            queue.push(WorkItem{n, item.level + 1});
+                            tasks.fetch_add(1);
+                        }
+                    }
+                } catch (const ParseException& e) {
+                    std::cerr<<"Parse error while expanding node: "<<item.node<<std::endl;
+                }
+            }
+
+            int remaining = tasks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                done.store(true);
+                queue.notify_all();
+            }
+        }
+
+        curl_easy_cleanup(curl);
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) workers.emplace_back(worker, i);
+    for (auto &t : workers) if (t.joinable()) t.join();
+
+    return levels;
+}
+
 // BFS Traversal Function
 std::vector<std::vector<std::string>> bfs(CURL* curl, const std::string& start, int depth) {
-  std::vector<std::vector<std::string>> levels;
-  std::unordered_set<std::string> visited;
-  
-  levels.push_back({start});
-  visited.insert(start);
-
-  for (int d = 0;  d < depth; d++) {
-    if (debug)
-      std::cout<<"starting level: "<<d<<"\n";
-    levels.push_back({});
-    for (std::string& s : levels[d]) {
-      try {
-	if (debug)
-	  std::cout<<"Trying to expand"<<s<<"\n";
-	for (const auto& neighbor : get_neighbors(fetch_neighbors(curl, s))) {
-	  if (debug)
-	    std::cout<<"neighbor "<<neighbor<<"\n";
-	  if (!visited.count(neighbor)) {
-	    visited.insert(neighbor);
-	    levels[d+1].push_back(neighbor);
-	  }
-	}
-      } catch (const ParseException& e) {
-	std::cerr<<"Error while fetching neighbors of: "<<s<<std::endl;
-	throw e;
-      }
-    }
-  }
-  
-  return levels;
+ std::vector<std::vector<std::string>> levels;
+ std::unordered_set<std::string> visited;
+ levels.push_back({start});
+ visited.insert(start);
+ for (int d = 0;  d < depth; d++) {
+   if (debug)
+     std::cout<<"starting level: "<<d<<"\n";
+   levels.push_back({});
+   for (std::string& s : levels[d]) {
+     try {
+       if (debug)
+         std::cout<<"Trying to expand"<<s<<"\n";
+       for (const auto& neighbor : get_neighbors(fetch_neighbors(curl, s))) {
+         if (debug)
+           std::cout<<"neighbor "<<neighbor<<"\n";
+         if (!visited.count(neighbor)) {
+           visited.insert(neighbor);
+           levels[d+1].push_back(neighbor);
+         }
+       }
+     } catch (const ParseException& e) {
+       std::cerr<<"Error while fetching neighbors of: "<<s<<std::endl;
+       throw e;
+     }
+   }
+ }
+ return levels;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <node_name> <depth>\n";
+    if (argc < 3 || argc > 4) {
+        std::cerr << "Usage: " << argv[0] << " [--sequential|--parallel] <node_name> <depth>\n";
         return 1;
     }
 
-    std::string start_node = argv[1];     // example "Tom%20Hanks"
+    bool use_parallel = true;
+    std::string start_node;
     int depth;
-    try {
+
+    if (argc == 4) {
+        std::string mode = argv[1];
+        if (mode == "--sequential")
+            use_parallel = false;
+        else if (mode != "--parallel") {
+            std::cerr << "Error: Unknown mode '" << mode << "'. Use --sequential or --parallel.\n";
+            return 1;
+        }
+        start_node = argv[2];
+        depth = std::stoi(argv[3]);
+    } else {
+        start_node = argv[1];
         depth = std::stoi(argv[2]);
-    } catch (const std::exception& e) {
-        std::cerr << "Error: Depth must be an integer.\n";
-        return 1;
+    }
+
+    if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+        std::cerr << "Failed to initialize libcurl\n";
+        return -1;
     }
 
     CURL* curl = curl_easy_init();
     if (!curl) {
         std::cerr << "Failed to initialize CURL\n";
+        curl_global_cleanup();
         return -1;
     }
 
+    const auto start = std::chrono::steady_clock::now();
 
-    const auto start{std::chrono::steady_clock::now()};
-    
-    
-    for (const auto& n : bfs(curl, start_node, depth)) {
-      for (const auto& node : n)
-	std::cout << "- " << node << "\n";
-      std::cout<<n.size()<<"\n";
+    std::vector<std::vector<std::string>> results;
+    if (use_parallel)
+        results = parallel_bfs(curl, start_node, depth);
+    else
+        results = bfs(curl, start_node, depth);
+
+    for (const auto& n : results) {
+        for (const auto& node : n)
+            std::cout << "- " << node << "\n";
+        std::cout << n.size() << "\n";
     }
-    
-    const auto finish{std::chrono::steady_clock::now()};
-    const std::chrono::duration<double> elapsed_seconds{finish - start};
-    std::cout << "Time to crawl: "<<elapsed_seconds.count() << "s\n";
-    
-    curl_easy_cleanup(curl);
 
-    
+    const auto finish = std::chrono::steady_clock::now();
+    const std::chrono::duration<double> elapsed_seconds{finish - start};
+    std::cout << "Time to crawl (" << (use_parallel ? "parallel" : "sequential")
+              << "): " << elapsed_seconds.count() << "s\n";
+
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+
     return 0;
 }

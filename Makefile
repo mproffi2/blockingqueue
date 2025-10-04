@@ -1,12 +1,14 @@
-#CXXFLAGS=-I ~/prgs/rapidjson/include
-LDFLAGS=-lcurl
+CXXFLAGS=-I$(HOME)/blockingqueue/rapidjson/include
 LD=g++
-CC=g++
+LDFLAGS=-lcurl
 
 all: client
 
 client: client.o
 	$(LD) $< -o $@ $(LDFLAGS)
 
+client.o: client.cpp
+	$(LD) $(CXXFLAGS) -c client.cpp -o client.o
+
 clean:
-	-rm client client.o
+	rm -f client client.o
